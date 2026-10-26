@@ -1,5 +1,6 @@
 import struct
 from dataclasses import dataclass
+from math import isfinite
 
 type OffsetDict = dict[str, int]
 
@@ -28,7 +29,7 @@ def read_baf_index(file_path: str) -> OffsetDict:
         offsets[name] = record.absolute_offset
 
     if unknown_records > 0:
-        print(f"Skipped {unknown_records} unknown records")
+        print(f"Skipped {unknown_records} unknown offset records")
 
     return offsets
 
@@ -146,52 +147,59 @@ def read_baf_main_raw(
 
         count = payload_size // 4
         intensities = struct.unpack(f"<{count}f", payload)
-        return intensities
+        return list(intensities)
 
 
 @dataclass
 class CalibrationRecord:
     mode: int
+    # ML3
     alpha: float
-    # Matches PP_MagnetronFrequency
+    # ML2
     beta: float
+    # ML1
     freq_high: float
     size: int
     freq_low: float
     freq_width: float
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "CalibrationRecord":
+    def calibration_fields_offset(cls, data: bytes) -> int | None:
         if len(data) < 8:
-            raise ValueError("Calibration record is too short")
+            return None
 
-        if data[:2] != b"\x04\x01":
-            raise ValueError("Not a calibration record")
+        declared_size = struct.unpack_from("<i", data, 0)[0]
+        if declared_size != len(data):
+            return None
 
-        offset = 4
-        header_size = struct.unpack_from("<i", data, offset)[0]
-
+        header_size = struct.unpack_from("<i", data, 4)[0]
         if header_size < 0:
-            raise ValueError("Invalid calibration header size")
+            return None
 
-        offset += header_size
+        block_size_offset = 4 + header_size
+        if block_size_offset + 4 > len(data):
+            return None
 
-        if offset + 4 > len(data):
-            raise ValueError(
-                "Calibration block size is outside the record"
-            )
-
-        block_size = struct.unpack_from("<i", data, offset)[0]
-
+        block_size = struct.unpack_from("<i", data, block_size_offset)[0]
         if block_size < header_size:
-            raise ValueError("Invalid calibration block size")
+            return None
 
-        offset += block_size - header_size
+        fields_offset = block_size_offset + block_size - header_size
+        if fields_offset + 64 > len(data):
+            return None
 
-        if offset + 64 > len(data):
-            raise ValueError("Calibration fields extend beyond the record")
+        return fields_offset
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "CalibrationRecord":
+        offset = cls.calibration_fields_offset(data)
+        if offset is None:
+            raise ValueError("Unrecognized calibration record layout")
 
         mode = struct.unpack_from("<i", data, offset + 8)[0]
+        if mode not in (4, 5):
+            raise ValueError(f"Unsupported calibration mode: {mode}")
+
         alpha = (
             struct.unpack_from("<d", data, offset + 12)[0]
             if mode == 5
@@ -202,14 +210,26 @@ class CalibrationRecord:
         if mode == 4:
             beta = -beta
 
+        freq_high = struct.unpack_from("<d", data, offset + 28)[0]
+        size = struct.unpack_from("<i", data, offset + 40)[0]
+        freq_low = struct.unpack_from("<d", data, offset + 48)[0]
+        freq_width = struct.unpack_from("<d", data, offset + 56)[0]
+        if not all(
+            isfinite(value)
+            for value in (alpha, beta, freq_high, freq_low, freq_width)
+        ):
+            raise ValueError("Calibration values must be finite")
+        if size <= 0 or freq_high == 0:
+            raise ValueError("Invalid calibration size or frequency")
+
         return cls(
             mode=mode,
             alpha=alpha,
             beta=beta,
-            freq_high=struct.unpack_from("<d", data, offset + 28)[0],
-            size=struct.unpack_from("<i", data, offset + 40)[0],
-            freq_low=struct.unpack_from("<d", data, offset + 48)[0],
-            freq_width=struct.unpack_from("<d", data, offset + 56)[0],
+            freq_high=freq_high,
+            size=size,
+            freq_low=freq_low,
+            freq_width=freq_width,
         )
 
     def index_to_mz(self, index: float) -> float:
@@ -225,15 +245,19 @@ class CalibrationRecord:
         return self.freq_high / denominator + self.alpha / self.freq_high
 
 
-def read_baf_calibration(file_path: str) -> "CalibrationRecord | None":
-    for raw in get_raw_vectors(file_path):
-        if len(raw) < 2:
-            raise ValueError("Record is too short to contain its IDs")
+def read_baf_calibration(file_path: str) -> CalibrationRecord:
+    matches = [
+        raw
+        for raw in get_raw_vectors(file_path)
+        if CalibrationRecord.calibration_fields_offset(raw) is not None
+    ]
 
-        if raw[:2] == b"\x04\x01":
-            return CalibrationRecord.from_bytes(raw)
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected one calibration record, found {len(matches)}"
+        )
 
-    return None
+    return CalibrationRecord.from_bytes(matches[0])
 
 
 def read_baf_maxima(
