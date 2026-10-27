@@ -1,5 +1,4 @@
 import argparse
-from dataclasses import fields
 
 from bruker_baf import (
     BafReader,
