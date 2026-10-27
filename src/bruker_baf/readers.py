@@ -5,16 +5,22 @@ from math import isfinite
 type OffsetDict = dict[str, int]
 
 
-# Read the index file (.baf_idx) and return a dictionary of section offsets.
-# The keys are section names and the values are absolute offsets in the file.
-def read_baf_index(file_path: str) -> OffsetDict:
+@dataclass
+class BafIndex:
+    header_offset: int
+    sections_by_flag: dict[int, OffsetDict]
+
+
+# Read the index file (.baf_idx) into global and per-flag section offsets.
+def read_baf_index(file_path: str) -> BafIndex:
     raw = get_raw_vectors(file_path)
 
     records = [
         IndexRecord.from_bytes(r) for r in raw if len(r) >= 2 and r[1] != 0
     ]
 
-    offsets = {}
+    header_offset = None
+    sections_by_flag: dict[int, OffsetDict] = {}
     unknown_records = 0
     for record in records:
         name = record.section_name
@@ -23,15 +29,32 @@ def read_baf_index(file_path: str) -> OffsetDict:
             unknown_records += 1
             continue
 
-        if name in offsets:
-            raise ValueError(f"Duplicate section name found: {name}")
+        if name == "header":
+            if header_offset is not None:
+                raise ValueError("Duplicate header section found")
+            header_offset = record.absolute_offset
+            continue
 
+        offsets = sections_by_flag.setdefault(record.flag, {})
+        if name in offsets:
+            raise ValueError(
+                f"Duplicate section name found for index flag "
+                f"{record.flag}: {name}"
+            )
         offsets[name] = record.absolute_offset
 
     if unknown_records > 0:
         print(f"Skipped {unknown_records} unknown offset records")
 
-    return offsets
+    if header_offset is None:
+        raise ValueError("No header section found in BAF index")
+    if not sections_by_flag:
+        raise ValueError("No data sections found in BAF index")
+
+    return BafIndex(
+        header_offset=header_offset,
+        sections_by_flag=sections_by_flag,
+    )
 
 
 @dataclass
@@ -134,7 +157,14 @@ def read_baf_spectrum_block(
             raise ValueError("Invalid spectrum block sizes")
 
         payload_size = block_size - header_size
-        if payload_size % 4 != 0:
+        if payload_size % 4 == 3:
+            file.seek(block_start + block_size - 3)
+            if file.read(3) != b"\x00\x00\x00":
+                raise ValueError(
+                    "Spectrum block has an unsupported 3-byte trailer"
+                )
+            payload_size -= 3
+        elif payload_size % 4 != 0:
             raise ValueError(
                 "Spectrum payload is not a whole number of floats"
             )
@@ -577,9 +607,9 @@ def read_baf_metadata_block(
 
     def read_value_block_header(
         file, block_name: str
-    ) -> tuple[int, int, int, int]:
+    ) -> tuple[int, int, int, int, int]:
         block_start = file.tell()
-        block_size, _delimiter, header_size, value_count = struct.unpack(
+        block_size, delimiter, header_size, value_count = struct.unpack(
             "<i4sii", read_exact(file, 16)
         )
         if header_size < 16 or header_size > block_size:
@@ -589,7 +619,14 @@ def read_baf_metadata_block(
         if block_size < header_size:
             raise ValueError(f"Invalid {block_name} block size")
         file.seek(block_start + header_size)
-        return block_start, block_size, header_size, value_count
+        block_type = struct.unpack_from("<H", delimiter)[0]
+        return (
+            block_start,
+            block_size,
+            header_size,
+            value_count,
+            block_type,
+        )
 
     def get_parameter(row_index: int) -> BafHeaderParameter:
         try:
@@ -624,6 +661,7 @@ def read_baf_metadata_block(
             numeric_size,
             numeric_header_size,
             numeric_count,
+            _numeric_type,
         ) = read_value_block_header(file, "numeric metadata")
         if numeric_size < numeric_header_size + numeric_count * 10:
             raise ValueError("Numeric metadata values exceed their block")
@@ -640,13 +678,22 @@ def read_baf_metadata_block(
             string_size,
             _string_header_size,
             string_count,
+            string_type,
         ) = read_value_block_header(file, "string metadata")
+        if string_type == 6:
+            raise NotImplementedError(
+                "Metadata block type 6 uses an unsupported value layout"
+            )
         string_values = []
         for _ in range(string_count):
             row_size = struct.unpack("<H", read_exact(file, 2))[0]
             if row_size < 8:
                 raise ValueError(
                     f"Invalid metadata string row size: {row_size}"
+                )
+            if file.tell() + row_size - 2 > string_start + string_size:
+                raise ValueError(
+                    "Metadata string row exceeds its declared block"
                 )
             row = b"\x00\x00" + read_exact(file, row_size - 2)
             row_index = struct.unpack_from("<H", row, 2)[0]

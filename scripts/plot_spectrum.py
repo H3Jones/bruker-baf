@@ -1,6 +1,6 @@
 import argparse
 
-from bruker_baf import BafReader
+from bruker_baf import BafReader, InstrumentType, UnsupportedInstrumentError
 
 
 def main() -> None:
@@ -19,6 +19,31 @@ def main() -> None:
     )
     args = parser.parse_args()
     reader = BafReader.from_directory(args.dot_d_directory)
+    instrument = reader.instrument_info
+    print(
+        f"Detected {instrument.model_name}: serial "
+        f"{instrument.serial_number}, part {instrument.part_number}"
+    )
+    run(reader, args.dot_d_directory, args.plot)
+
+
+def run(
+    reader: BafReader,
+    dataset: str,
+    should_plot: bool,
+) -> None:
+    match reader.instrument_type:
+        case InstrumentType.TIMS_TOF:
+            raise NotImplementedError(
+                "Spectrum parsing for TIMS-TOF is not implemented yet"
+            )
+        case InstrumentType.FTMS:
+            pass
+        case instrument_type:
+            raise UnsupportedInstrumentError(
+                f"No calibrated spectrum route for {instrument_type.value}"
+            )
+
     calibration = reader.read_calibration()
     spectrum = reader.read_spectrum()
     peak_mz, peak_intensities = reader.read_maxima()
@@ -26,13 +51,13 @@ def main() -> None:
     print("Calibration record:", calibration)
     print(f"Found {len(spectrum.intensities)} intensity values")
 
-    if args.plot:
+    if should_plot:
         plot(
             spectrum.mass_to_charge,
             spectrum.intensities,
             peak_mz,
             peak_intensities,
-            args.dot_d_directory,
+            dataset,
         )
 
 
