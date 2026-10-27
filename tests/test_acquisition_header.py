@@ -1,8 +1,8 @@
 import struct
-import tempfile
-import unittest
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from bruker_baf.readers import (
     BafAcquisitionStrings,
@@ -15,7 +15,7 @@ _TAG_VARIABLE_DEFS = 0xBFA03002
 _TAG_CALIBRATION = 0xBFA00006
 
 
-class AcquisitionHeaderTests(unittest.TestCase):
+class TestAcquisitionHeader:
     def test_string_fields_are_cleaned_and_missing_fields_default_to_none(
         self,
     ) -> None:
@@ -23,67 +23,58 @@ class AcquisitionHeaderTests(unittest.TestCase):
             [" source path ", "solariX", None, "  ", "version"]
         )
 
-        self.assertEqual(strings.source_path, " source path ")
-        self.assertEqual(strings.instrument_name, "solariX")
-        self.assertIsNone(strings.operator)
-        self.assertIsNone(strings.acquisition_software)
-        self.assertEqual(strings.software_version, "version")
-        self.assertIsNone(strings.sample_name)
-        self.assertIsNone(strings.sample_description)
+        assert strings.source_path == " source path "
+        assert strings.instrument_name == "solariX"
+        assert strings.operator is None
+        assert strings.acquisition_software is None
+        assert strings.software_version == "version"
+        assert strings.sample_name is None
+        assert strings.sample_description is None
 
-    def test_reads_documented_acquisition_header_fields(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            baf_path = Path(directory) / "analysis.baf"
-            baf_path.write_bytes(self._acquisition_record())
+    def test_reads_documented_acquisition_header_fields(
+        self, tmp_path: Path
+    ) -> None:
+        baf_path = tmp_path / "analysis.baf"
+        baf_path.write_bytes(self._acquisition_record())
 
-            header = read_baf_acquisition_header(baf_path, 0)
+        header = read_baf_acquisition_header(baf_path, 0)
 
-        self.assertEqual(
-            header.started_utc,
-            datetime(2024, 2, 15, 9, 8, 7, 321000, tzinfo=UTC),
+        assert header.started_utc == datetime(
+            2024, 2, 15, 9, 8, 7, 321000, tzinfo=UTC
         )
-        self.assertEqual(header.utc_offset_minutes, -60)
-        self.assertEqual(header.analysis_name, "sample-run")
-        self.assertEqual(
-            header.source_path, r"D:\raw\sample.d\analysis.baf"
-        )
-        self.assertEqual(header.instrument_name, "solariX")
-        self.assertEqual(header.operator, "operator")
-        self.assertEqual(header.acquisition_software, "software")
-        self.assertEqual(header.software_version, "version")
-        self.assertEqual(header.method_name, "method")
-        self.assertEqual(header.dotted_version, "version.part")
-        self.assertEqual(header.role, "role")
-        self.assertEqual(header.sample_name, "sample-name")
-        self.assertEqual(header.sample_description, "sample-description")
-        self.assertEqual(header.strings.sample_name, "sample-name")
-        self.assertEqual(
-            header.strings.sample_description,
-            "sample-description",
-        )
-        self.assertEqual(header.string(2), "operator")
-        self.assertEqual(
-            header.variables[12].name,
-            "Collision_Energy_Act",
-        )
-        self.assertEqual(header.variables[12].group, "MS")
-        self.assertEqual(header.variables[12].label, "Collision energy")
-        self.assertEqual(header.variables[12].format, "%0.2f")
-        self.assertEqual(header.variables[12].unit, "eV")
-        self.assertEqual(header.variables[12].kind, 10)
-        self.assertEqual(header.reference_calibrations, [b"CAL!"])
+        assert header.utc_offset_minutes == -60
+        assert header.analysis_name == "sample-run"
+        assert header.source_path == r"D:\raw\sample.d\analysis.baf"
+        assert header.instrument_name == "solariX"
+        assert header.operator == "operator"
+        assert header.acquisition_software == "software"
+        assert header.software_version == "version"
+        assert header.method_name == "method"
+        assert header.dotted_version == "version.part"
+        assert header.role == "role"
+        assert header.sample_name == "sample-name"
+        assert header.sample_description == "sample-description"
+        assert header.strings.sample_name == "sample-name"
+        assert header.strings.sample_description == "sample-description"
+        assert header.string(2) == "operator"
+        assert header.variables[12].name == "Collision_Energy_Act"
+        assert header.variables[12].group == "MS"
+        assert header.variables[12].label == "Collision energy"
+        assert header.variables[12].format == "%0.2f"
+        assert header.variables[12].unit == "eV"
+        assert header.variables[12].kind == 10
+        assert header.reference_calibrations == [b"CAL!"]
 
-    def test_rejects_non_acquisition_record(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            baf_path = Path(directory) / "analysis.baf"
-            baf_path.write_bytes(struct.pack("<II", 8, 0xBFA00008))
+    def test_rejects_non_acquisition_record(self, tmp_path: Path) -> None:
+        baf_path = tmp_path / "analysis.baf"
+        baf_path.write_bytes(struct.pack("<II", 8, 0xBFA00008))
 
-            with self.assertRaisesRegex(
-                ValueError, "Expected acquisition"
-            ):
-                read_baf_acquisition_header(baf_path, 0)
+        with pytest.raises(ValueError, match="Expected acquisition"):
+            read_baf_acquisition_header(baf_path, 0)
 
-    def test_reads_sample_values_after_empty_string_slots(self) -> None:
+    def test_reads_sample_values_after_empty_string_slots(
+        self, tmp_path: Path
+    ) -> None:
         strings = [
             r"D:\raw\sample.d\analysis.baf",
             "solariX",
@@ -96,22 +87,18 @@ class AcquisitionHeaderTests(unittest.TestCase):
             "anonymized-sample",
             "synthetic description",
         ]
-        with tempfile.TemporaryDirectory() as directory:
-            baf_path = Path(directory) / "analysis.baf"
-            baf_path.write_bytes(self._acquisition_record(strings))
+        baf_path = tmp_path / "analysis.baf"
+        baf_path.write_bytes(self._acquisition_record(strings))
 
-            header = read_baf_acquisition_header(baf_path, 0)
+        header = read_baf_acquisition_header(baf_path, 0)
 
-        self.assertEqual(header.sample_name, "anonymized-sample")
-        self.assertEqual(
-            header.sample_description,
-            "synthetic description",
-        )
-        self.assertIsNone(header.operator)
-        self.assertIsNone(header.role)
-        self.assertIsNone(header.strings.operator)
-        self.assertIsNone(header.strings.role)
-        self.assertEqual(header.string_label(8), "sample_name")
+        assert header.sample_name == "anonymized-sample"
+        assert header.sample_description == "synthetic description"
+        assert header.operator is None
+        assert header.role is None
+        assert header.strings.operator is None
+        assert header.strings.role is None
+        assert header.string_label(8) == "sample_name"
 
     @classmethod
     def _acquisition_record(
@@ -154,7 +141,9 @@ class AcquisitionHeaderTests(unittest.TestCase):
         header_size = 12 + 4 * (len(strings) - 1)
         first_string = strings[0]
         if first_string is None:
-            raise ValueError("The first string-table entry cannot be empty")
+            raise ValueError(
+                "The first string-table entry cannot be empty"
+            )
         string_data = bytearray(first_string.encode("utf-8") + b"\x00")
         offsets = []
         for value in strings[1:]:
@@ -212,7 +201,3 @@ class AcquisitionHeaderTests(unittest.TestCase):
             )
             + entry
         )
-
-
-if __name__ == "__main__":
-    unittest.main()
