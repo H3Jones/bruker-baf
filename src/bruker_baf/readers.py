@@ -116,10 +116,10 @@ def get_raw_vectors(filename) -> list[bytes]:
 
 
 def read_baf_spectrum_block(
-    baf_file_path: str, offsets: OffsetDict
+    baf_file_path: str, offset: int
 ) -> list[float]:
     with open(baf_file_path, "rb") as file:
-        block_start = offsets["spectrum"]
+        block_start = offset
         file.seek(block_start)
 
         header = file.read(12)
