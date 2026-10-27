@@ -8,10 +8,12 @@ from .instruments import (
     read_instrument_info,
 )
 from .readers import (
+    BafAcquisitionHeader,
     BafIndex,
     BafMetadataValue,
     CalibrationRecord,
     OffsetDict,
+    read_baf_acquisition_header,
     read_baf_calibration,
     read_baf_file_header,
     read_baf_index,
@@ -88,9 +90,17 @@ class BafReader:
         return self.calibration
 
     @cached_property
+    def acquisition_header(self) -> BafAcquisitionHeader:
+        return read_baf_acquisition_header(
+            self.baf_path, self.index.header_offset
+        )
+
+    @cached_property
     def instrument_info(self) -> InstrumentInfo:
         return read_instrument_info(
-            self.baf_path, self.index.header_offset
+            self.baf_path,
+            self.index.header_offset,
+            self.acquisition_header,
         )
 
     @property

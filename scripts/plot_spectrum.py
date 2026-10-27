@@ -1,6 +1,11 @@
 import argparse
+from dataclasses import fields
 
-from bruker_baf import BafReader, InstrumentType, UnsupportedInstrumentError
+from bruker_baf import (
+    BafReader,
+    InstrumentType,
+    UnsupportedInstrumentError,
+)
 
 
 def main() -> None:
@@ -20,10 +25,13 @@ def main() -> None:
     args = parser.parse_args()
     reader = BafReader.from_directory(args.dot_d_directory)
     instrument = reader.instrument_info
+    acquisition_header = reader.acquisition_header
+
     print(
         f"Detected {instrument.model_name}: serial "
         f"{instrument.serial_number}, part {instrument.part_number}"
     )
+    print(f"Acquisition started at: {acquisition_header.started_utc}")
     run(reader, args.dot_d_directory, args.plot)
 
 

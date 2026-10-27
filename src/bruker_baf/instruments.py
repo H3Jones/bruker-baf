@@ -1,10 +1,8 @@
-import struct
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-_TAG_ACQUISITION = 0xBFA03001
-_TAG_STRINGS = 0xBFA03003
+from .readers import BafAcquisitionHeader, read_baf_acquisition_header
 
 
 class InstrumentType(str, Enum):
@@ -24,78 +22,10 @@ class InstrumentInfo:
     part_number: str
 
 
-def _read_acquisition_strings(
-    baf_path: str | Path, header_offset: int
-) -> list[bytes]:
-    with open(baf_path, "rb") as file:
-        file.seek(header_offset)
-        root_header = file.read(8)
-        if len(root_header) != 8:
-            raise EOFError("BAF file ends before the acquisition header")
-        record_size, record_tag = struct.unpack("<II", root_header)
-        if record_tag != _TAG_ACQUISITION:
-            raise ValueError(
-                f"Expected acquisition record at offset {header_offset}, "
-                f"found tag 0x{record_tag:08x}"
-            )
-        if record_size < 8:
-            raise ValueError("Invalid acquisition record size")
-        file.seek(header_offset)
-        record = file.read(record_size)
-        if len(record) != record_size:
-            raise EOFError("BAF acquisition record is truncated")
-
-    tag_bytes = struct.pack("<I", _TAG_STRINGS)
-    search_offset = 8
-    while True:
-        tag_offset = record.find(tag_bytes, search_offset)
-        if tag_offset < 4:
-            break
-        block_offset = tag_offset - 4
-        if block_offset + 12 <= len(record):
-            block_size, block_tag, header_size = struct.unpack_from(
-                "<III", record, block_offset
-            )
-            block_end = block_offset + block_size
-            if (
-                block_tag == _TAG_STRINGS
-                and header_size >= 12
-                and header_size <= block_size
-                and (header_size - 12) % 4 == 0
-                and block_end <= len(record)
-            ):
-                block = record[block_offset:block_end]
-                offsets = [header_size]
-                for position in range(12, header_size, 4):
-                    string_offset = struct.unpack_from(
-                        "<I", block, position
-                    )[0]
-                    if string_offset == 0:
-                        break
-                    if not header_size <= string_offset < block_size:
-                        raise ValueError(
-                            "Invalid string offset in acquisition header"
-                        )
-                    offsets.append(string_offset)
-
-                strings = []
-                for string_offset in offsets:
-                    terminator = block.find(b"\x00", string_offset)
-                    if terminator < 0:
-                        raise ValueError(
-                            "Unterminated string in acquisition header"
-                        )
-                    strings.append(block[string_offset:terminator])
-                return strings
-        search_offset = tag_offset + len(tag_bytes)
-
-    raise ValueError(
-        "BAF acquisition header does not contain a valid string table"
-    )
-
-
 def read_instrument_info(
-    baf_path: str | Path, header_offset: int
+    baf_path: str | Path,
+    header_offset: int,
+    acquisition_header: BafAcquisitionHeader | None = None,
 ) -> InstrumentInfo:
     if header_offset <= 0:
         raise ValueError("Invalid global header offset")
@@ -160,20 +90,16 @@ def read_instrument_info(
             f"Invalid instrument part number after marker in {baf_path}"
         )
 
-    acquisition_strings = _read_acquisition_strings(
-        baf_path, header_offset
-    )
-    if len(acquisition_strings) < 2 or not acquisition_strings[1]:
+    if acquisition_header is None:
+        acquisition_header = read_baf_acquisition_header(
+            baf_path, header_offset
+        )
+    model_name = acquisition_header.instrument_name
+    if model_name is None:
         raise ValueError(
             "BAF acquisition string table does not contain an instrument "
             "model name"
         )
-    try:
-        model_name = acquisition_strings[1].decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError(
-            "BAF acquisition instrument model name is not valid UTF-8"
-        ) from error
 
     return InstrumentInfo(
         instrument_type=instrument_type,

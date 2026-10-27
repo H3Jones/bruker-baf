@@ -1,8 +1,16 @@
 import struct
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from math import isfinite
+from pathlib import Path
 
 type OffsetDict = dict[str, int]
+
+_TAG_BASE = 0xBFA00000
+_TAG_ACQUISITION = 0xBFA03001
+_TAG_VARIABLE_DEFS = 0xBFA03002
+_TAG_STRINGS = 0xBFA03003
+_TAG_CALIBRATION = 0xBFA00006
 
 
 @dataclass
@@ -359,6 +367,113 @@ class BafHeaderParameter:
     unit: str | None
 
 
+@dataclass(frozen=True)
+class BafAcquisitionVariable:
+    name: str
+    group: str
+    label: str
+    value_text: str
+    format: str
+    unit: str
+    kind: int
+
+
+@dataclass(frozen=True)
+class BafAcquisitionStrings:
+    source_path: str | None = None
+    instrument_name: str | None = None
+    operator: str | None = None
+    acquisition_software: str | None = None
+    software_version: str | None = None
+    method_name: str | None = None
+    dotted_version: str | None = None
+    role: str | None = None
+    sample_name: str | None = None
+    sample_description: str | None = None
+
+    @classmethod
+    def from_table(
+        cls, strings: list[str | None]
+    ) -> "BafAcquisitionStrings":
+        names = tuple(cls.__dataclass_fields__)
+
+        def clean(index: int) -> str | None:
+            if index >= len(strings):
+                return None
+            value = strings[index]
+            return value if value and value.strip() else None
+
+        return cls(
+            **{name: clean(index) for index, name in enumerate(names)}
+        )
+
+
+@dataclass
+class BafAcquisitionHeader:
+    started_utc: datetime | None
+    utc_offset_minutes: int | None
+    analysis_name: str | None
+    strings: BafAcquisitionStrings
+    variables: dict[int, BafAcquisitionVariable]
+    reference_calibrations: list[bytes]
+
+    def string(self, index: int) -> str | None:
+        if index < 0:
+            raise ValueError("String-table index cannot be negative")
+        names = tuple(BafAcquisitionStrings.__dataclass_fields__)
+        if index >= len(names):
+            return None
+        return getattr(self.strings, names[index])
+
+    def string_label(self, index: int) -> str | None:
+        if index < 0:
+            raise ValueError("String-table index cannot be negative")
+        names = tuple(BafAcquisitionStrings.__dataclass_fields__)
+        if index >= len(names):
+            return None
+        return names[index]
+
+    @property
+    def source_path(self) -> str | None:
+        return self.strings.source_path
+
+    @property
+    def instrument_name(self) -> str | None:
+        return self.strings.instrument_name
+
+    @property
+    def operator(self) -> str | None:
+        return self.strings.operator
+
+    @property
+    def acquisition_software(self) -> str | None:
+        return self.strings.acquisition_software
+
+    @property
+    def software_version(self) -> str | None:
+        return self.strings.software_version
+
+    @property
+    def method_name(self) -> str | None:
+        return self.strings.method_name
+
+    @property
+    def dotted_version(self) -> str | None:
+        return self.strings.dotted_version
+
+    @property
+    def role(self) -> str | None:
+        return self.strings.role
+
+    @property
+    def sample_name(self) -> str | None:
+        return self.strings.sample_name
+
+    @property
+    def sample_description(self) -> str | None:
+        return self.strings.sample_description
+
+
 @dataclass
 class BafMetadataValue(BafHeaderParameter):
     raw_value: float | str
@@ -471,6 +586,286 @@ def _decode_baf_text(data: bytes, context: str) -> str:
                 f"{context} contains text that is neither UTF-8 "
                 "nor Windows-1252"
             ) from error
+
+
+def _read_acquisition_date(
+    record: bytes, offset: int
+) -> tuple[datetime, int] | None:
+    if offset + 11 > len(record):
+        return None
+
+    day, month, year, utc_offset, milliseconds, second, minute, hour = (
+        struct.unpack_from("<BBHhHBBB", record, offset)
+    )
+    if milliseconds > 999:
+        return None
+    try:
+        started_utc = datetime(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            milliseconds * 1000,
+            tzinfo=UTC,
+        )
+    except ValueError:
+        return None
+    return started_utc, utc_offset
+
+
+def _read_acquisition_string_table(
+    block: bytes,
+) -> list[str | None]:
+    if len(block) < 12:
+        raise ValueError("Acquisition string table is too short")
+
+    block_size, block_tag, header_size = struct.unpack_from("<III", block)
+    if block_tag != _TAG_STRINGS or block_size != len(block):
+        raise ValueError("Invalid acquisition string-table record")
+    if (
+        header_size < 12
+        or header_size >= block_size
+        or (header_size - 12) % 4 != 0
+    ):
+        raise ValueError("Invalid acquisition string-table header size")
+
+    offsets: list[int | None] = [header_size]
+    table_offsets = [
+        struct.unpack_from("<I", block, position)[0]
+        for position in range(12, header_size, 4)
+    ]
+    for index, string_offset in enumerate(table_offsets):
+        if string_offset == 0:
+            if any(
+                header_size <= later_offset < block_size
+                for later_offset in table_offsets[index + 1 :]
+            ):
+                offsets.append(None)
+                continue
+            break
+        if not header_size <= string_offset < block_size:
+            if any(
+                header_size <= later_offset < block_size
+                for later_offset in table_offsets[index + 1 :]
+            ):
+                raise ValueError(
+                    "Invalid string offset before later acquisition strings"
+                )
+            break
+        offsets.append(string_offset)
+
+    strings: list[str | None] = []
+    for string_offset in offsets:
+        if string_offset is None:
+            strings.append(None)
+            continue
+        terminator = block.find(b"\x00", string_offset)
+        if terminator < 0:
+            raise ValueError(
+                "Unterminated string in acquisition string table"
+            )
+        strings.append(
+            _decode_baf_text(
+                block[string_offset:terminator],
+                "Acquisition string table",
+            )
+        )
+    return strings
+
+
+def _read_acquisition_variables(
+    block: bytes,
+) -> dict[int, BafAcquisitionVariable]:
+    if len(block) < 12:
+        raise ValueError("Acquisition variable definitions are too short")
+
+    block_size, block_tag = struct.unpack_from("<II", block)
+    if block_size != len(block) or block_tag != _TAG_VARIABLE_DEFS:
+        raise ValueError("Invalid acquisition variable-definition record")
+    header_size, variable_count = struct.unpack_from("<HH", block, 8)
+    if header_size < 12 or header_size > block_size:
+        raise ValueError(
+            "Invalid acquisition variable-definition header size"
+        )
+
+    variables: dict[int, BafAcquisitionVariable] = {}
+    position = header_size
+    for _ in range(variable_count):
+        if position + 20 > block_size:
+            raise ValueError(
+                "Acquisition variable definition exceeds its record"
+            )
+        entry_size, variable_id, kind = struct.unpack_from(
+            "<HHB", block, position
+        )
+        if entry_size < 20 or position + entry_size > block_size:
+            raise ValueError(
+                "Invalid acquisition variable-definition entry size"
+            )
+        field_offsets = struct.unpack_from("<7H", block, position + 6)
+        fields = []
+        for field_offset in field_offsets[1:]:
+            if field_offset == 0:
+                fields.append("")
+                continue
+            if not 20 <= field_offset < entry_size:
+                raise ValueError(
+                    "Invalid text offset in acquisition variable definition"
+                )
+            field_start = position + field_offset
+            field_end = block.find(
+                b"\x00", field_start, position + entry_size
+            )
+            if field_end < 0:
+                raise ValueError(
+                    "Unterminated text in acquisition variable definition"
+                )
+            fields.append(
+                _decode_baf_text(
+                    block[field_start:field_end],
+                    f"Acquisition variable {variable_id}",
+                )
+            )
+
+        if variable_id in variables:
+            raise ValueError(
+                f"Duplicate acquisition variable id: {variable_id}"
+            )
+        variables[variable_id] = BafAcquisitionVariable(
+            name=fields[0],
+            group=fields[1],
+            label=fields[2],
+            value_text=fields[3],
+            format=fields[4],
+            unit=fields[5],
+            kind=kind,
+        )
+        position += entry_size
+
+    if any(block[position:]):
+        raise ValueError(
+            "Unexpected data after acquisition variable definitions"
+        )
+    return variables
+
+
+def read_baf_acquisition_header(
+    file_path: str | Path, header_offset: int
+) -> BafAcquisitionHeader:
+    if header_offset < 0:
+        raise ValueError("Acquisition header offset cannot be negative")
+
+    with open(file_path, "rb") as file:
+        file.seek(header_offset)
+        root_header = file.read(8)
+        if len(root_header) != 8:
+            raise EOFError("Incomplete acquisition header record")
+        record_size, record_tag = struct.unpack("<II", root_header)
+        if record_tag != _TAG_ACQUISITION:
+            raise ValueError(
+                f"Expected acquisition record at offset {header_offset}, "
+                f"found tag 0x{record_tag:08x}"
+            )
+        if record_size < 8:
+            raise ValueError("Invalid acquisition record size")
+        file.seek(header_offset)
+        record = file.read(record_size)
+        if len(record) != record_size:
+            raise EOFError("Incomplete acquisition record")
+
+    started_utc = None
+    utc_offset_minutes = None
+    tail = 48
+    for date_offset in (48, 52):
+        date = _read_acquisition_date(record, date_offset)
+        if date is not None:
+            started_utc, utc_offset_minutes = date
+            tail = date_offset + 12
+            break
+
+    tag_bytes = struct.pack("<I", _TAG_STRINGS)
+    tag_offset = record.find(tag_bytes, tail + 4)
+    if tag_offset < 0:
+        raise ValueError(
+            "Acquisition header does not contain a string table"
+        )
+    strings_offset = tag_offset - 4
+    if strings_offset + 12 > len(record):
+        raise ValueError("Incomplete acquisition string-table header")
+    strings_size, strings_tag = struct.unpack_from(
+        "<II", record, strings_offset
+    )
+    strings_end = strings_offset + strings_size
+    if (
+        strings_tag != _TAG_STRINGS
+        or strings_size < 12
+        or strings_end > len(record)
+    ):
+        raise ValueError("Invalid acquisition string-table record")
+    string_table = _read_acquisition_string_table(
+        record[strings_offset:strings_end]
+    )
+    strings = BafAcquisitionStrings.from_table(string_table)
+
+    analysis_name_data = record[tail:strings_offset]
+    analysis_name_end = analysis_name_data.find(b"\x00")
+    if analysis_name_end >= 0:
+        analysis_name_data = analysis_name_data[:analysis_name_end]
+    analysis_name = _decode_baf_text(
+        analysis_name_data, "Acquisition analysis name"
+    )
+    if not analysis_name:
+        analysis_name = None
+
+    variables: dict[int, BafAcquisitionVariable] = {}
+    variable_definitions_seen = False
+    reference_calibrations = []
+    position = strings_offset
+    while position < len(record):
+        if position + 8 > len(record):
+            raise ValueError("Truncated sub-record in acquisition header")
+        subrecord_size, subrecord_tag = struct.unpack_from(
+            "<II", record, position
+        )
+        if (
+            subrecord_size < 8
+            or subrecord_size > len(record) - position
+            or subrecord_tag & 0xFFFF0000 != _TAG_BASE
+        ):
+            raise ValueError(
+                f"Invalid acquisition sub-record at offset {position}"
+            )
+        subrecord = record[position : position + subrecord_size]
+        if subrecord_tag == _TAG_STRINGS:
+            if position != strings_offset:
+                raise ValueError(
+                    "Duplicate acquisition string-table record"
+                )
+        elif subrecord_tag == _TAG_VARIABLE_DEFS:
+            if variable_definitions_seen:
+                raise ValueError(
+                    "Duplicate acquisition variable-definition record"
+                )
+            variable_definitions_seen = True
+            variables = _read_acquisition_variables(subrecord)
+        elif subrecord_tag == _TAG_CALIBRATION:
+            if subrecord_size < 12:
+                raise ValueError(
+                    "Invalid acquisition reference-calibration record"
+                )
+            reference_calibrations.append(subrecord[12:])
+        position += subrecord_size
+
+    return BafAcquisitionHeader(
+        started_utc=started_utc,
+        utc_offset_minutes=utc_offset_minutes,
+        analysis_name=analysis_name,
+        strings=strings,
+        variables=variables,
+        reference_calibrations=reference_calibrations,
+    )
 
 
 def read_baf_file_header(
