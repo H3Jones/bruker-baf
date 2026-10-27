@@ -2,9 +2,11 @@ import argparse
 
 from utils import (
     read_baf_calibration,
+    read_baf_file_header,
     read_baf_index,
-    read_baf_main_raw,
-    read_baf_maxima,
+    read_baf_maxima_block,
+    read_baf_metadata_block,
+    read_baf_spectrum_block,
 )
 
 
@@ -70,7 +72,7 @@ def main() -> None:
 
     print("Calibration record:", calibration_record)
 
-    intensities = read_baf_main_raw(
+    intensities = read_baf_spectrum_block(
         full_path(base_directory, main_file[0]), offsets
     )
 
@@ -81,7 +83,7 @@ def main() -> None:
     ]
 
     # maxima import
-    peak_mz, peak_intensities = read_baf_maxima(
+    peak_mz, peak_intensities = read_baf_maxima_block(
         full_path(base_directory, main_file[0]),
         offsets["maxima"],
         calibration_record,
