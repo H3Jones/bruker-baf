@@ -1,38 +1,83 @@
-# Bruker .baf file parser
+# Bruker BAF reader
 
-Rough python implementation derived from the work of [rtms](https://nathanieltwarog.r-universe.dev/rtms)
+A Python reader for Bruker `.baf` mass-spectrometry data, derived from the
+work of [rtms](https://nathanieltwarog.r-universe.dev/rtms).
 
+## Supported data
 
-## Calibration record payload
+- FT-ICR (FTMS) profile and centroid spectra.
+- TIMS-TOF centroid spectra, using an existing `analysis.sqlite` Baf2Sql cache.
+- Instrument identification and acquisition-header information.
+- Explicit scan selection for datasets containing multiple scans.
 
-Calibration records are stored as payloads inside the `.baf_xtr` record
-framing. The offsets below are relative to the calibration payload and all
-numeric values are little-endian.
+Reading is native Python: no Bruker DLL or pyBaf2Sql dependency is required.
+TOF profile spectra and ion-mobility extraction are not supported, and
+some TOF metadata layouts cannot yet be decoded. TOF reading uses acquisition
+calibration, not later recalibration.
 
-| Payload offset | Field | Type |
-| --- | --- | --- |
-| `0x00` | Declared payload size | `int32` |
-| `0x04` | Header size | `int32` |
-| `0x04 + header_size` | Block size | `int32` |
-| Calculated offset | Calibration fields begin | See formula below |
+## Setup
 
-The parser calculates the fields offset from the header:
+Requires Python 3.13 or newer. From a checkout, install the project and its
+development dependencies with [uv](https://docs.astral.sh/uv/):
 
-```text
-fields_offset = (4 + header_size) + (block_size - header_size)
+```powershell
+uv sync
 ```
 
-For the observed layouts, `header_size` is 12. A block size of 60 gives a
-fields offset of `0x40`; a block size of 64 gives `0x44`. Supported payload
-sizes observed so far are 260, 300, and 308 bytes. The first word is the
-declared payload size, not a format marker.
+## Basic usage
 
-| Relative to fields offset | Field | Type |
-| --- | --- | --- |
-| `+8` | Mode | `int32` |
-| `+12` | Alpha (mode 5) | `float64` |
-| `+20` | Beta | `float64` |
-| `+28` | High frequency | `float64` |
-| `+40` | Size | `int32` |
-| `+48` | Low frequency | `float64` |
-| `+56` | Frequency width | `float64` |
+Open a `.d` directory containing `.baf`, `.baf_idx`, and `.baf_xtr` files.
+TOF datasets also require an existing `analysis.sqlite` cache; the reader
+does not create or regenerate it.
+
+```python
+from bruker_baf import BafReader
+
+reader = BafReader.from_directory(r"path\to\dataset.d")
+print(reader.instrument_info)
+print(reader.acquisition_header.started_utc)
+print(reader.scan_ids)
+
+scan_id = reader.scan_ids[0]
+spectrum = reader.read_spectrum(scan_id=scan_id)
+mz = spectrum.mass_to_charge
+intensities = spectrum.intensities
+```
+
+The factory selects the appropriate instrument-specific reader. FT-ICR
+defaults to profile mode; TOF defaults to centroid mode. Pass
+`mode="centroid"` to request centroid spectra explicitly.
+
+Scans are read individually, **not aggregated**. An explicit `scan_id` is
+required when a dataset contains multiple scans; it may be omitted for a
+single-scan dataset.
+
+### Plot a spectrum
+
+```powershell
+uv run .\scripts\plot_spectrum.py "path\to\dataset.d" --plot
+```
+
+For a selected TOF scan:
+
+```powershell
+uv run .\scripts\plot_spectrum.py "path\to\tof.d" --scan-id 1 --mode centroid --plot
+```
+
+### Inspect acquisition strings
+
+```powershell
+uv run .\scripts\dump_acquisition_strings.py "path\to\dataset.d"
+```
+
+## Tests
+
+```powershell
+uv run pytest
+```
+
+## Implementation details
+
+See [implementation notes](./implementation-notes.md) for reader design,
+binary layouts, calibration equations, validation results, and detailed
+limitations.
