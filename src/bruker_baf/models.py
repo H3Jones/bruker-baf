@@ -28,6 +28,7 @@ from .tof import (
     TofCalibrationRecord,
     read_tof_calibration,
     read_tof_centroid_block,
+    read_tof_profile_block,
 )
 
 
@@ -279,8 +280,6 @@ class TofBafReader(BafReader):
         self, scan_id: int | None = None
     ) -> TofCalibrationRecord:
         scan_id, offsets = self._scan_offsets(scan_id)
-        if "maxima" not in offsets:
-            raise ValueError(f"Scan {scan_id} has no centroid block")
         if scan_id not in self._calibrations:
             self._calibrations[scan_id] = read_tof_calibration(
                 self.sqlite_path.resolve(),
@@ -288,7 +287,8 @@ class TofBafReader(BafReader):
                 baf_path=self.baf_path,
                 index_path=self.index_path,
                 calibration_path=self.calibration_path,
-                centroid_offset=offsets["maxima"],
+                centroid_offset=offsets.get("maxima"),
+                profile_offset=offsets.get("spectrum"),
             )
         return self._calibrations[scan_id]
 
@@ -301,9 +301,10 @@ class TofBafReader(BafReader):
         mode = self._spectrum_mode(mode)
         _, offsets = self._scan_offsets(scan_id)
         if mode == "profile":
-            raise NotImplementedError(
-                "Compressed TOF profile spectra are not supported; "
-                "use mode='centroid'"
+            if "spectrum" not in offsets:
+                raise ValueError("This BAF scan has no profile block")
+            return read_tof_profile_block(
+                self.baf_path, offsets["spectrum"]
             )
         if "maxima" not in offsets:
             raise ValueError("This BAF scan has no centroid block")

@@ -77,7 +77,7 @@ declared payload size, not a format marker.
 | `+48` | Low frequency | `float64` |
 | `+56` | Frequency width | `float64` |
 
-## Native TOF centroid support
+## Native TOF spectrum support
 
 ### SQLite cache and calibration mapping
 
@@ -85,7 +85,14 @@ TOF reading uses an existing `analysis.sqlite` Baf2Sql cache alongside
 `analysis.baf`, `analysis.baf_idx`, and `analysis.baf_xtr`. No Bruker DLL,
 pyBaf2Sql, or additional Python dependency is needed. The cache is opened
 read-only, never created or regenerated. Its recorded file sizes and
-centroid array identifiers are checked against the BAF files.
+array identifiers are checked against the BAF files. Centroid arrays use
+identity kinds `0x10`, `0x16`, and `0x11` for indices, m/z, and intensities.
+Profile m/z and intensity identities use `0x43` and `0x42`. The lower 56
+bits identify the corresponding BAF block offset.
+
+Calibration lookup validates the identities for the indexed spectrum
+blocks, without requiring centroid data. Profile-only scans use their
+profile identities; centroid-only scans use their centroid identities.
 
 `Spectra.TransformatorId` selects the scan's calibration from
 `Transformators.Blob`. These blobs are also present in `.baf_xtr`; SQLite
@@ -108,6 +115,45 @@ m/z = m - mass_offset
 
 The parser uses a numerically stable quadratic root.
 
+### Profile layout and compression
+
+The supported profile block has tag `0xBFA01001`, a 44-byte header, and
+encoding field `0x00060102` at header offset 20. The word at offset 24 is
+the payload byte count, which must equal the block size minus header size.
+Other encodings are rejected, not interpreted as FT-ICR float arrays.
+
+The observed compressed payload begins with little-endian uint32 words:
+marker `0xEE77` and the decoded sample count. A fixed 30-byte codec
+configuration follows, including its 26-byte settings section. Only the
+verified configuration is accepted.
+
+Data bits are read most-significant-bit first. Tokens use a unary prefix
+of zero bits terminated by one:
+
+| Leading zeros | Meaning |
+| --- | --- |
+| 0 | Repeat the previous intensity once |
+| 1-7 | Magnitude bits followed by a sign bit |
+| 8 | Full signed 32-bit delta |
+| 9 | Unsigned 32-bit run length; repeat the previous intensity |
+
+For prefixes 1-7 the magnitude bit widths are `4, 5, 6, 7, 9, 10, 11`;
+their additive magnitude bases are `1, 17, 49, 113, 241, 753, 1777`.
+A sign bit of one indicates a negative delta. The previous intensity
+starts at zero and delta accumulation wraps as uint32, matching the
+stored representation. The public API returns these values as floats,
+like the other spectrum readers.
+
+Runs must be nonempty and cannot exceed the remaining declared sample
+count. After exactly that count, the decoder requires a 16-bit end marker
+of `1`, zero padding to a 32-bit payload boundary, and a three-byte zero
+block trailer. Truncation, invalid prefixes, overrunning runs, extra bytes,
+and malformed markers or padding raise explicit errors.
+
+Profile coordinates are consecutive sample indices starting at zero.
+Each is converted to m/z using the selected scan's `TofCalibrationRecord`.
+No centroid interpolation, binning, or scan aggregation is performed.
+
 ### Validation
 
 Native output was checked against Bruker's Baf2Sql output for 209,735
@@ -115,10 +161,19 @@ centroids across two example datasets (97 scans), with maximum absolute
 m/z error below `7e-13` Da and exact intensity matches. Native reading was
 also exercised across all 17 cached example datasets (560 scans).
 
+Profile intensities and m/z arrays were also compared in full with
+Bruker's acquisition-calibration output on copied datasets. The first
+three references cover 128 scans and 69,254,819 profile points: intensities
+match exactly and maximum absolute m/z error is below `3e-12` Da.
+All 560 cached example scans use the supported compression configuration.
+The first and last profiles from each of the 17 datasets were decoded,
+covering both observed profile lengths (618,833 and 297,678 samples).
+
 ### Limitations
 
-Compressed TOF profile spectra, nonzero higher-order corrections, and
-other calibration/centroid encodings raise `NotImplementedError`.
+Other TOF profile compression configurations, nonzero higher-order
+corrections, and other calibration/centroid encodings raise
+`NotImplementedError`.
 The reader uses acquisition calibration from the cache, not later
 recalibration in `calibration.sqlite` or `Calibrator.ami`, and does not
 extract ion mobility.

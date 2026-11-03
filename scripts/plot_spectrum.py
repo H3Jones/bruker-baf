@@ -50,7 +50,11 @@ def run(
 ) -> None:
     calibration = reader.read_calibration(scan_id)
     spectrum = reader.read_spectrum(scan_id, mode=mode)
-    peak_mz, peak_intensities = reader.read_maxima(scan_id)
+    selected_scan = scan_id if scan_id is not None else reader.scan_ids[0]
+    if "maxima" in reader.index.sections_by_flag[selected_scan]:
+        peak_mz, peak_intensities = reader.read_maxima(scan_id)
+    else:
+        peak_mz, peak_intensities = [], ()
 
     print("Calibration record:", calibration)
     print(f"Found {len(spectrum.intensities)} intensity values")

@@ -6,14 +6,15 @@ work of [rtms](https://nathanieltwarog.r-universe.dev/rtms).
 ## Supported data
 
 - FT-ICR (FTMS) profile and centroid spectra.
-- TIMS-TOF centroid spectra, using an existing `analysis.sqlite` Baf2Sql cache.
+- TIMS-TOF profile and centroid spectra, using an existing `analysis.sqlite`
+  Baf2Sql cache.
 - Instrument identification and acquisition-header information.
 - Explicit scan selection for datasets containing multiple scans.
 
 Reading is native Python: no Bruker DLL or pyBaf2Sql dependency is required.
-TOF profile spectra and ion-mobility extraction are not supported, and
-some TOF metadata layouts cannot yet be decoded. TOF reading uses acquisition
-calibration, not later recalibration.
+Ion-mobility extraction and some TOF metadata layouts are not supported.
+TOF reading uses acquisition calibration, not later recalibration.
+Unrecognised profile compression formats are rejected explicitly.
 
 ## Setup
 
@@ -48,6 +49,12 @@ The factory selects the appropriate instrument-specific reader. FT-ICR
 defaults to profile mode; TOF defaults to centroid mode. Pass
 `mode="centroid"` to request centroid spectra explicitly.
 
+For a TOF profile spectrum, including scans without centroid data:
+
+```python
+profile = reader.read_spectrum(scan_id=scan_id, mode="profile")
+```
+
 Scans are read individually, **not aggregated**. An explicit `scan_id` is
 required when a dataset contains multiple scans; it may be omitted for a
 single-scan dataset.
@@ -63,6 +70,8 @@ For a selected TOF scan:
 ```powershell
 uv run .\scripts\plot_spectrum.py "path\to\tof.d" --scan-id 1 --mode centroid --plot
 ```
+
+Use `--mode profile` to plot the profile instead.
 
 ### Inspect acquisition strings
 

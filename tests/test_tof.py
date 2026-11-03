@@ -1,3 +1,4 @@
+import runpy
 import sqlite3
 import struct
 from contextlib import closing
@@ -15,7 +16,30 @@ from bruker_baf import (
     TofBafReader,
     UnsupportedInstrumentError,
 )
-from bruker_baf.tof import TofCalibrationRecord, read_tof_centroid_block
+from bruker_baf.tof import (
+    TofCalibrationRecord,
+    read_tof_centroid_block,
+    read_tof_profile_block,
+)
+
+
+def _profile_block(codes: str, count: int) -> bytes:
+    payload = bytearray(
+        struct.pack("<2I", 0xEE77, count)
+        + bytes.fromhex(
+            "0000001a0004050607090a0b20010203040506070809000000010000000a"
+        )
+    )
+    bits = codes + "0000000000000001"
+    bits += "0" * (-(len(payload) * 8 + len(bits)) % 32)
+    payload.extend(int(bits[i : i + 8], 2) for i in range(0, len(bits), 8))
+    payload.extend(bytes(3))
+    header = bytearray(44)
+    struct.pack_into(
+        "<3I", header, 0, len(header) + len(payload), 0xBFA01001, 44
+    )
+    struct.pack_into("<2I", header, 20, 0x00060102, len(payload))
+    return header + payload
 
 
 def _calibration_blob() -> bytes:
@@ -74,6 +98,24 @@ def tof_reader(
         (58136.591397849465, 66467.32283464567), (246.0, 334.0)
     )
     second = _centroid_block((78503.23979591837,), (518.0,))
+    profile_first = _profile_block(
+        "1"
+        + "01"
+        + "1111"
+        + "0"
+        + "1"
+        + "01"
+        + "0001"
+        + "0"
+        + "001"
+        + "00001"
+        + "1",
+        5,
+    )
+    profile_second = _profile_block(
+        "01" + "0011" + "0" + "01" + "0001" + "1" + "01" + "0001" + "1",
+        3,
+    )
     preamble = b"AIDA6.4\x0000000001\x00timsTOF Pro\x0000000002\x00"
     source = b"C:\\synthetic.d\\analysis.baf\x00"
     model = b"synthetic TOF\x00"
@@ -94,15 +136,27 @@ def tof_reader(
         + strings
     )
     prefix = preamble + acquisition
-    baf_path.write_bytes(prefix + first + second)
-    offsets = (len(prefix), len(prefix) + len(first))
+    baf_path.write_bytes(
+        prefix + profile_first + first + profile_second + second
+    )
+    profile_offsets = (
+        len(prefix),
+        len(prefix) + len(profile_first) + len(first),
+    )
+    offsets = (
+        len(prefix) + len(profile_first),
+        profile_offsets[1] + len(profile_second),
+    )
     index_path = tmp_path / "analysis.baf_idx"
     index_path.write_bytes(
         _index_vector((1, 48), 0, len(preamble))
         + b"".join(
             _index_vector(kind, scan_id, offset)
-            for scan_id, offset in enumerate(offsets, 1)
-            for kind in ((1, 16), (2, 16))
+            for scan_id, centroid_offset in enumerate(offsets, 1)
+            for kind, offset in (
+                ((1, 16), profile_offsets[scan_id - 1]),
+                ((2, 16), centroid_offset),
+            )
         )
         + struct.pack("<i4si", 0, bytes(4), 0)
     )
@@ -120,7 +174,8 @@ def tof_reader(
             "CREATE TABLE Info (BAFSize INTEGER, IDXSize INTEGER, XTRSize INTEGER);"
             "CREATE TABLE Transformators (Id INTEGER PRIMARY KEY, Blob BLOB);"
             "CREATE TABLE Spectra (Id INTEGER PRIMARY KEY, TransformatorId INTEGER,"
-            "LineIndexId INTEGER, LineMzId INTEGER, LineIntensityId INTEGER);"
+            "LineIndexId INTEGER, LineMzId INTEGER, LineIntensityId INTEGER,"
+            "ProfileMzId INTEGER, ProfileIntensityId INTEGER);"
         )
         connection.execute(
             "INSERT INTO Info VALUES (?, ?, ?)",
@@ -139,13 +194,15 @@ def tof_reader(
                 "INSERT INTO Transformators VALUES (?, ?)", (scan_id, blob)
             )
             connection.execute(
-                "INSERT INTO Spectra VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO Spectra VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     scan_id,
                     scan_id,
                     (0x10 << 56) | offset,
                     (0x16 << 56) | offset,
                     (0x11 << 56) | offset,
+                    (0x43 << 56) | profile_offsets[scan_id - 1],
+                    (0x42 << 56) | profile_offsets[scan_id - 1],
                 ),
             )
     monkeypatch.setattr(
@@ -294,6 +351,167 @@ class TestTofCentroids:
             read_tof_centroid_block(path, 0)
 
 
+class TestTofProfiles:
+    def test_decodes_vendor_prefix(self, tmp_path: Path) -> None:
+        # First 41 stream bits from the vendor-verified background scan.
+        bits = "".join(f"{v:08b}" for v in bytes.fromhex("ffffffef9f80"))[
+            :41
+        ]
+        path = tmp_path / "analysis.baf"
+        path.write_bytes(_profile_block(bits, 29))
+        assert read_tof_profile_block(path, 0) == [0.0] * 27 + [16.0, 0.0]
+
+    @pytest.mark.parametrize(
+        ("selector", "width", "base"),
+        [
+            (1, 4, 1),
+            (2, 5, 17),
+            (3, 6, 49),
+            (4, 7, 113),
+            (5, 9, 241),
+            (6, 10, 753),
+            (7, 11, 1777),
+        ],
+    )
+    @pytest.mark.parametrize("upper", [False, True])
+    def test_decodes_all_magnitude_buckets(
+        self,
+        tmp_path: Path,
+        selector: int,
+        width: int,
+        base: int,
+        upper: bool,
+    ) -> None:
+        raw = (1 << width) - 1 if upper else 0
+        prefix = "0" * selector + "1"
+        magnitude_bits = f"{raw:0{width}b}"
+        codes = (
+            prefix + magnitude_bits + "0" + prefix + magnitude_bits + "1"
+        )
+        path = tmp_path / "analysis.baf"
+        path.write_bytes(_profile_block(codes, 2))
+        assert read_tof_profile_block(path, 0) == [float(base + raw), 0.0]
+
+    def test_decodes_signed_32_bit_literals(self, tmp_path: Path) -> None:
+        deltas = [5000, -5000, -2147483648, 2147483647, 1]
+        codes = "".join(
+            "000000001" + f"{delta & 0xFFFFFFFF:032b}" for delta in deltas
+        )
+        path = tmp_path / "analysis.baf"
+        path.write_bytes(_profile_block(codes, len(deltas)))
+        assert read_tof_profile_block(path, 0) == [
+            5000.0,
+            0.0,
+            2147483648.0,
+            4294967295.0,
+            0.0,
+        ]
+
+    def test_runs_repeat_previous_intensity(self, tmp_path: Path) -> None:
+        codes = "0100110" + "0000000001" + f"{100:032b}"
+        path = tmp_path / "analysis.baf"
+        path.write_bytes(_profile_block(codes, 101))
+        assert read_tof_profile_block(path, 0) == [4.0] * 101
+
+    def test_decodes_empty_profile(self, tmp_path: Path) -> None:
+        path = tmp_path / "analysis.baf"
+        path.write_bytes(_profile_block("", 0))
+        assert read_tof_profile_block(path, 0) == []
+
+    @pytest.mark.parametrize("run", [0, 2, 0xFFFFFFFF])
+    def test_rejects_invalid_run_lengths(
+        self, tmp_path: Path, run: int
+    ) -> None:
+        path = tmp_path / "analysis.baf"
+        path.write_bytes(_profile_block("0000000001" + f"{run:032b}", 1))
+        with pytest.raises(ValueError, match="run length"):
+            read_tof_profile_block(path, 0)
+
+    def test_rejects_unknown_prefix(self, tmp_path: Path) -> None:
+        path = tmp_path / "analysis.baf"
+        path.write_bytes(_profile_block("0" * 10, 1))
+        with pytest.raises(ValueError, match="variable-length code"):
+            read_tof_profile_block(path, 0)
+
+    @pytest.mark.parametrize(
+        ("offset", "value", "error", "message"),
+        [
+            (4, 0, ValueError, "Expected a TOF profile"),
+            (8, 40, NotImplementedError, "encoding"),
+            (20, 0, NotImplementedError, "encoding"),
+            (24, 0, ValueError, "sizes"),
+            (44, 0, NotImplementedError, "compression"),
+            (52, 0, NotImplementedError, "compression"),
+        ],
+    )
+    def test_rejects_invalid_headers(
+        self,
+        tmp_path: Path,
+        offset: int,
+        value: int,
+        error: type[Exception],
+        message: str,
+    ) -> None:
+        block = bytearray(_profile_block("1", 1))
+        struct.pack_into("<I", block, offset, value)
+        path = tmp_path / "analysis.baf"
+        path.write_bytes(block)
+        with pytest.raises(error, match=message):
+            read_tof_profile_block(path, 0)
+
+    @pytest.mark.parametrize("size", [0, 12, 43, 50, 80])
+    def test_rejects_truncated_blocks(
+        self, tmp_path: Path, size: int
+    ) -> None:
+        path = tmp_path / "analysis.baf"
+        path.write_bytes(_profile_block("1", 1)[:size])
+        with pytest.raises(EOFError):
+            read_tof_profile_block(path, 0)
+
+    @pytest.mark.parametrize(
+        ("bit", "message"),
+        [
+            (0, "variable-length code"),
+            (16, "end marker"),
+            (17, "alignment padding"),
+            (48, "block trailer"),
+        ],
+    )
+    def test_rejects_corrupted_stream(
+        self, tmp_path: Path, bit: int, message: str
+    ) -> None:
+        block = bytearray(_profile_block("1", 1))
+        if bit == 0:
+            struct.pack_into("<I", block, 48, 2)
+        else:
+            offset = 44 + 38 + bit // 8
+            block[offset] ^= 1 << (7 - bit % 8)
+        path = tmp_path / "analysis.baf"
+        path.write_bytes(block)
+        with pytest.raises(ValueError, match=message):
+            read_tof_profile_block(path, 0)
+
+    def test_rejects_extra_bytes(self, tmp_path: Path) -> None:
+        block = bytearray(_profile_block("1", 1))
+        block[-3:-3] = bytes(4)
+        struct.pack_into("<I", block, 0, len(block))
+        struct.pack_into("<I", block, 24, len(block) - 44)
+        path = tmp_path / "analysis.baf"
+        path.write_bytes(block)
+        with pytest.raises(ValueError, match="alignment padding"):
+            read_tof_profile_block(path, 0)
+
+    def test_rejects_truncated_bitstream(self, tmp_path: Path) -> None:
+        block = bytearray(_profile_block("1", 1))
+        del block[-7:-3]
+        struct.pack_into("<I", block, 0, len(block))
+        struct.pack_into("<I", block, 24, len(block) - 44)
+        path = tmp_path / "analysis.baf"
+        path.write_bytes(block)
+        with pytest.raises(EOFError, match="bitstream"):
+            read_tof_profile_block(path, 0)
+
+
 class TestTofReader:
     def test_reads_selected_scan_with_its_own_calibration(
         self, tof_reader: TofBafReader
@@ -337,13 +555,69 @@ class TestTofReader:
         with pytest.raises(ValueError, match="Unknown BAF scan ID"):
             tof_reader.read_spectrum(99)
 
-    def test_rejects_profile_instead_of_reading_compressed_bytes(
-        self, tof_reader: BafReader
+    def test_reads_profile_with_scan_calibration(
+        self, tof_reader: TofBafReader
     ) -> None:
-        with pytest.raises(NotImplementedError, match="Compressed TOF"):
+        for scan_id, expected in ((1, [0, 16, 16, 18, 0]), (2, [4, 2, 0])):
+            spectrum = tof_reader.read_spectrum(scan_id, mode="profile")
+            assert spectrum.intensities == expected
+            calibration = tof_reader.read_calibration(scan_id)
+            assert spectrum.mass_to_charge == [
+                calibration.index_to_mz(i) for i in range(len(expected))
+            ]
+            assert (
+                tof_reader.read_intensities(scan_id, mode="profile")
+                == expected
+            )
+
+    def test_reads_profile_only_scan(
+        self, tof_reader: TofBafReader, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        tof_reader.index.sections_by_flag[1].pop("maxima")
+        with closing(sqlite3.connect(tof_reader.sqlite_path)) as c, c:
+            c.execute(
+                "UPDATE Spectra SET LineMzId = NULL, LineIndexId = NULL, "
+                "LineIntensityId = NULL WHERE Id = 1"
+            )
+        assert isinstance(
+            tof_reader.read_calibration(1), TofCalibrationRecord
+        )
+        assert tof_reader.read_spectrum(1, mode="profile").intensities == [
+            0,
+            16,
+            16,
+            18,
+            0,
+        ]
+        with pytest.raises(ValueError, match="no maxima block"):
+            tof_reader.read_maxima(1)
+        cli = runpy.run_path(
+            str(Path(__file__).parents[1] / "scripts" / "plot_spectrum.py")
+        )
+        cli["run"](
+            tof_reader, "synthetic profile-only scan", False, 1, "profile"
+        )
+        assert "Found 5 intensity values" in capsys.readouterr().out
+
+    def test_rejects_calibration_without_spectrum_blocks(
+        self, tof_reader: TofBafReader
+    ) -> None:
+        tof_reader.index.sections_by_flag[1].clear()
+        with pytest.raises(ValueError, match="no spectrum blocks"):
+            tof_reader.read_calibration(1)
+
+    def test_reads_centroid_only_scan(
+        self, tof_reader: TofBafReader
+    ) -> None:
+        tof_reader.index.sections_by_flag[1].pop("spectrum")
+        with closing(sqlite3.connect(tof_reader.sqlite_path)) as c, c:
+            c.execute(
+                "UPDATE Spectra SET ProfileMzId = NULL, "
+                "ProfileIntensityId = NULL WHERE Id = 1"
+            )
+        assert tof_reader.read_spectrum(1).intensities == [246, 334]
+        with pytest.raises(ValueError, match="no profile block"):
             tof_reader.read_spectrum(1, mode="profile")
-        with pytest.raises(NotImplementedError, match="Compressed TOF"):
-            tof_reader.read_intensities(1, mode="profile")
 
     def test_missing_cache_is_not_created(
         self, tof_reader: TofBafReader
@@ -360,6 +634,10 @@ class TestTofReader:
         [
             ("UPDATE Info SET BAFSize = 0", "file sizes"),
             ("UPDATE Spectra SET LineMzId = 0 WHERE Id = 1", "identity"),
+            (
+                "UPDATE Spectra SET ProfileMzId = 0 WHERE Id = 1",
+                "profile identity",
+            ),
             (
                 "DELETE FROM Transformators WHERE Id = 1",
                 "no TOF calibration",
