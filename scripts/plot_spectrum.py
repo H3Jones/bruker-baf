@@ -1,15 +1,22 @@
 import argparse
+from typing import Literal
 
-from bruker_baf import (
-    BafReader,
-    InstrumentType,
-    UnsupportedInstrumentError,
-)
+from bruker_baf import BafReader
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Read and optionally plot a Bruker BAF spectrum"
+    )
+    parser.add_argument(
+        "--scan-id",
+        type=int,
+        help="Scan ID to read (required for datasets with multiple scans)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("profile", "centroid"),
+        help="Defaults to FTMS profile or TOF centroid",
     )
     parser.add_argument(
         "dot_d_directory",
@@ -31,29 +38,19 @@ def main() -> None:
         f"{instrument.serial_number}, part {instrument.part_number}"
     )
     print(f"Acquisition started at: {acquisition_header.started_utc}")
-    run(reader, args.dot_d_directory, args.plot)
+    run(reader, args.dot_d_directory, args.plot, args.scan_id, args.mode)
 
 
 def run(
     reader: BafReader,
     dataset: str,
     should_plot: bool,
+    scan_id: int | None = None,
+    mode: Literal["profile", "centroid"] | None = None,
 ) -> None:
-    match reader.instrument_type:
-        case InstrumentType.TIMS_TOF:
-            raise NotImplementedError(
-                "Spectrum parsing for TIMS-TOF is not implemented yet"
-            )
-        case InstrumentType.FTMS:
-            pass
-        case instrument_type:
-            raise UnsupportedInstrumentError(
-                f"No calibrated spectrum route for {instrument_type.value}"
-            )
-
-    calibration = reader.read_calibration()
-    spectrum = reader.read_spectrum()
-    peak_mz, peak_intensities = reader.read_maxima()
+    calibration = reader.read_calibration(scan_id)
+    spectrum = reader.read_spectrum(scan_id, mode=mode)
+    peak_mz, peak_intensities = reader.read_maxima(scan_id)
 
     print("Calibration record:", calibration)
     print(f"Found {len(spectrum.intensities)} intensity values")

@@ -1,17 +1,20 @@
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
+from typing import Literal
 
 from .instruments import (
     InstrumentInfo,
     InstrumentType,
+    UnsupportedInstrumentError,
     read_instrument_info,
 )
 from .readers import (
     BafAcquisitionHeader,
     BafIndex,
     BafMetadataValue,
-    CalibrationRecord,
+    FticrCalibrationRecord,
     OffsetDict,
     read_baf_acquisition_header,
     read_baf_calibration,
@@ -21,6 +24,11 @@ from .readers import (
     read_baf_metadata_block,
     read_baf_spectrum_block,
 )
+from .tof import (
+    TofCalibrationRecord,
+    read_tof_calibration,
+    read_tof_centroid_block,
+)
 
 
 @dataclass
@@ -29,7 +37,10 @@ class Spectrum:
     mass_to_charge: list[float]
 
 
-class BafReader:
+class BafReader(ABC):
+    _default_mode: Literal["profile", "centroid"]
+    _instrument_type: InstrumentType
+
     def __init__(
         self,
         baf_path: Path,
@@ -44,7 +55,11 @@ class BafReader:
         self.parameters = read_baf_file_header(
             str(self.baf_path), self.index.header_offset
         )
-        self.calibration: CalibrationRecord | None = None
+        if self.instrument_type is not self._instrument_type:
+            raise UnsupportedInstrumentError(
+                f"{type(self).__name__} cannot read "
+                f"{self.instrument_type.value} data"
+            )
 
     @classmethod
     def from_directory(cls, directory: str | Path) -> "BafReader":
@@ -62,7 +77,24 @@ class BafReader:
         baf_path = cls._find_unique(directory, ".baf")
         index_path = cls._find_unique(directory, ".baf_idx")
         calibration_path = cls._find_unique(directory, ".baf_xtr")
-        return cls(baf_path, index_path, calibration_path)
+        index = read_baf_index(str(index_path))
+        instrument = read_instrument_info(baf_path, index.header_offset)
+        reader_type: type[BafReader]
+        match instrument.instrument_type:
+            case InstrumentType.FTMS:
+                reader_type = FticrBafReader
+            case InstrumentType.TIMS_TOF:
+                reader_type = TofBafReader
+            case instrument_type:
+                raise UnsupportedInstrumentError(
+                    f"No BAF reader for {instrument_type.value}"
+                )
+        if cls is not BafReader and cls is not reader_type:
+            raise UnsupportedInstrumentError(
+                f"{cls.__name__} cannot read "
+                f"{instrument.instrument_type.value} data"
+            )
+        return reader_type(baf_path, index_path, calibration_path)
 
     @staticmethod
     def _find_unique(directory: Path, suffix: str) -> Path:
@@ -82,12 +114,10 @@ class BafReader:
             )
         return matches[0]
 
-    def read_calibration(self) -> CalibrationRecord:
-        if self.calibration is None:
-            self.calibration = read_baf_calibration(
-                str(self.calibration_path)
-            )
-        return self.calibration
+    @abstractmethod
+    def read_calibration(
+        self, scan_id: int | None = None
+    ) -> FticrCalibrationRecord | TofCalibrationRecord: ...
 
     @cached_property
     def acquisition_header(self) -> BafAcquisitionHeader:
@@ -107,23 +137,53 @@ class BafReader:
     def instrument_type(self) -> InstrumentType:
         return self.instrument_info.instrument_type
 
-    def _single_scan_offsets(self) -> OffsetDict:
-        if len(self.index.sections_by_flag) != 1:
-            raise NotImplementedError(
-                "Reading BAF files with multiple scan groups is not "
-                "implemented yet"
+    @property
+    def scan_ids(self) -> tuple[int, ...]:
+        return tuple(sorted(self.index.sections_by_flag))
+
+    def _scan_offsets(self, scan_id: int | None) -> tuple[int, OffsetDict]:
+        if scan_id is None:
+            if len(self.scan_ids) != 1:
+                raise NotImplementedError(
+                    "This BAF file has multiple scan groups; "
+                    "select a scan_id explicitly"
+                )
+            scan_id = self.scan_ids[0]
+        if scan_id not in self.index.sections_by_flag:
+            raise ValueError(f"Unknown BAF scan ID: {scan_id}")
+        return scan_id, self.index.sections_by_flag[scan_id]
+
+    def _spectrum_mode(
+        self, mode: Literal["profile", "centroid"] | None
+    ) -> Literal["profile", "centroid"]:
+        if mode is None:
+            return self._default_mode
+        if mode not in ("profile", "centroid"):
+            raise ValueError(f"Unknown spectrum mode: {mode}")
+        return mode
+
+    @abstractmethod
+    def read_intensities(
+        self,
+        scan_id: int | None = None,
+        *,
+        mode: Literal["profile", "centroid"] | None = None,
+    ) -> list[float]: ...
+
+    def read_spectrum(
+        self,
+        scan_id: int | None = None,
+        *,
+        mode: Literal["profile", "centroid"] | None = None,
+    ) -> Spectrum:
+        mode = self._spectrum_mode(mode)
+        if mode == "centroid":
+            mz, intensities = self.read_maxima(scan_id)
+            return Spectrum(
+                intensities=list(intensities), mass_to_charge=mz
             )
-        return next(iter(self.index.sections_by_flag.values()))
-
-    def read_intensities(self) -> list[float]:
-        offsets = self._single_scan_offsets()
-        return read_baf_spectrum_block(
-            str(self.baf_path), offsets["spectrum"]
-        )
-
-    def read_spectrum(self) -> Spectrum:
-        intensities = self.read_intensities()
-        calibration = self.read_calibration()
+        intensities = self.read_intensities(scan_id, mode=mode)
+        calibration = self.read_calibration(scan_id)
         mass_to_charge = [
             calibration.index_to_mz(i) for i in range(len(intensities))
         ]
@@ -131,22 +191,135 @@ class BafReader:
             intensities=intensities, mass_to_charge=mass_to_charge
         )
 
-    def read_maxima(self) -> tuple[list[float], tuple[float, ...]]:
-        offsets = self._single_scan_offsets()
-        if "maxima" not in offsets:
-            raise ValueError("This BAF file has no maxima block")
-        return read_baf_maxima_block(
-            str(self.baf_path),
-            offsets["maxima"],
-            self.read_calibration(),
-        )
+    @abstractmethod
+    def read_maxima(
+        self, scan_id: int | None = None
+    ) -> tuple[list[float], tuple[float, ...]]: ...
 
-    def read_metadata(self) -> list[BafMetadataValue]:
-        offsets = self._single_scan_offsets()
+    def read_metadata(
+        self, scan_id: int | None = None
+    ) -> list[BafMetadataValue]:
+        _, offsets = self._scan_offsets(scan_id)
         if "metadata" not in offsets:
             raise ValueError("This BAF file has no metadata block")
         return read_baf_metadata_block(
             str(self.baf_path),
             offsets["metadata"],
             self.parameters,
+        )
+
+
+class FticrBafReader(BafReader):
+    _default_mode: Literal["profile", "centroid"] = "profile"
+    _instrument_type = InstrumentType.FTMS
+
+    def __init__(
+        self,
+        baf_path: Path,
+        index_path: Path,
+        calibration_path: Path,
+    ) -> None:
+        super().__init__(baf_path, index_path, calibration_path)
+        self._calibration: FticrCalibrationRecord | None = None
+
+    def read_calibration(
+        self, scan_id: int | None = None
+    ) -> FticrCalibrationRecord:
+        if scan_id is not None:
+            self._scan_offsets(scan_id)
+        if self._calibration is None:
+            self._calibration = read_baf_calibration(
+                str(self.calibration_path)
+            )
+        return self._calibration
+
+    def read_intensities(
+        self,
+        scan_id: int | None = None,
+        *,
+        mode: Literal["profile", "centroid"] | None = None,
+    ) -> list[float]:
+        mode = self._spectrum_mode(mode)
+        _, offsets = self._scan_offsets(scan_id)
+        if mode == "centroid":
+            return list(self.read_maxima(scan_id)[1])
+        return read_baf_spectrum_block(
+            str(self.baf_path), offsets["spectrum"]
+        )
+
+    def read_maxima(
+        self, scan_id: int | None = None
+    ) -> tuple[list[float], tuple[float, ...]]:
+        _, offsets = self._scan_offsets(scan_id)
+        if "maxima" not in offsets:
+            raise ValueError("This BAF file has no maxima block")
+        return read_baf_maxima_block(
+            str(self.baf_path),
+            offsets["maxima"],
+            self.read_calibration(scan_id),
+        )
+
+
+class TofBafReader(BafReader):
+    _default_mode: Literal["profile", "centroid"] = "centroid"
+    _instrument_type = InstrumentType.TIMS_TOF
+
+    def __init__(
+        self,
+        baf_path: Path,
+        index_path: Path,
+        calibration_path: Path,
+        sqlite_path: Path | None = None,
+    ) -> None:
+        super().__init__(baf_path, index_path, calibration_path)
+        self.sqlite_path = sqlite_path or baf_path.with_suffix(".sqlite")
+        self._calibrations: dict[int, TofCalibrationRecord] = {}
+
+    def read_calibration(
+        self, scan_id: int | None = None
+    ) -> TofCalibrationRecord:
+        scan_id, offsets = self._scan_offsets(scan_id)
+        if "maxima" not in offsets:
+            raise ValueError(f"Scan {scan_id} has no centroid block")
+        if scan_id not in self._calibrations:
+            self._calibrations[scan_id] = read_tof_calibration(
+                self.sqlite_path.resolve(),
+                scan_id,
+                baf_path=self.baf_path,
+                index_path=self.index_path,
+                calibration_path=self.calibration_path,
+                centroid_offset=offsets["maxima"],
+            )
+        return self._calibrations[scan_id]
+
+    def read_intensities(
+        self,
+        scan_id: int | None = None,
+        *,
+        mode: Literal["profile", "centroid"] | None = None,
+    ) -> list[float]:
+        mode = self._spectrum_mode(mode)
+        _, offsets = self._scan_offsets(scan_id)
+        if mode == "profile":
+            raise NotImplementedError(
+                "Compressed TOF profile spectra are not supported; "
+                "use mode='centroid'"
+            )
+        if "maxima" not in offsets:
+            raise ValueError("This BAF scan has no centroid block")
+        return read_tof_centroid_block(self.baf_path, offsets["maxima"])[1]
+
+    def read_maxima(
+        self, scan_id: int | None = None
+    ) -> tuple[list[float], tuple[float, ...]]:
+        _, offsets = self._scan_offsets(scan_id)
+        if "maxima" not in offsets:
+            raise ValueError("This BAF file has no maxima block")
+        calibration = self.read_calibration(scan_id)
+        indices, intensities = read_tof_centroid_block(
+            self.baf_path, offsets["maxima"]
+        )
+        return (
+            [calibration.index_to_mz(index) for index in indices],
+            tuple(intensities),
         )
