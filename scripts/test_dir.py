@@ -1,4 +1,5 @@
 import argparse
+import sqlite3
 import struct
 from pathlib import Path
 
@@ -11,12 +12,12 @@ def find_dot_d_directories(folder: str | Path) -> list[Path]:
         folder = folder.parent
     if folder.is_dir() and folder.suffix.lower() == ".d":
         return [folder]
-    return sorted(
-        path for path in folder.rglob("*.d") if path.is_dir()
-    )
+    return sorted(path for path in folder.rglob("*.d") if path.is_dir())
 
 
-def test_reading_dot_d_directories(folder: str | Path) -> None:
+def test_reading_dot_d_directories(
+    folder: str | Path, scan_id: int | None = None
+) -> None:
     dot_d_dirs = find_dot_d_directories(folder)
     print(f"Found {len(dot_d_dirs)} .d directories in {folder}")
     if not dot_d_dirs:
@@ -56,21 +57,23 @@ def test_reading_dot_d_directories(folder: str | Path) -> None:
             instrument_result = f"failed: {error}"
 
         try:
-            calibration = reader.read_calibration()
+            calibration = reader.read_calibration(scan_id)
             calibration_result = f"mode={calibration.mode}"
         except (
             EOFError,
             KeyError,
             OSError,
             NotImplementedError,
+            TypeError,
             ValueError,
+            sqlite3.Error,
             struct.error,
         ) as error:
             failures += 1
             calibration_result = f"failed: {error}"
 
         try:
-            metadata = reader.read_metadata()
+            metadata = reader.read_metadata(scan_id)
             metadata_result = f"{len(metadata)} entries"
         except (
             EOFError,
@@ -84,7 +87,7 @@ def test_reading_dot_d_directories(folder: str | Path) -> None:
             metadata_result = f"failed: {error}"
 
         try:
-            intensities = reader.read_intensities()
+            intensities = reader.read_intensities(scan_id)
             spectrum_result = f"{len(intensities)} intensities"
         except (
             EOFError,
@@ -115,6 +118,11 @@ if __name__ == "__main__":
         description="Test reading .d directories with BafReader"
     )
     parser.add_argument("folder", help="Folder containing .d directories")
+    parser.add_argument(
+        "--scan-id",
+        type=int,
+        help="Scan ID to read (required for datasets with multiple scans)",
+    )
     args = parser.parse_args()
 
-    test_reading_dot_d_directories(args.folder)
+    test_reading_dot_d_directories(args.folder, args.scan_id)

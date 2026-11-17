@@ -189,7 +189,7 @@ def read_baf_spectrum_block(
 
 
 @dataclass
-class CalibrationRecord:
+class FticrCalibrationRecord:
     mode: int
     # ML3
     alpha: float
@@ -229,7 +229,7 @@ class CalibrationRecord:
         return fields_offset
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "CalibrationRecord":
+    def from_bytes(cls, data: bytes) -> "FticrCalibrationRecord":
         offset = cls.calibration_fields_offset(data)
         if offset is None:
             raise ValueError("Unrecognized calibration record layout")
@@ -283,11 +283,11 @@ class CalibrationRecord:
         return self.freq_high / denominator + self.alpha / self.freq_high
 
 
-def read_baf_calibration(file_path: str) -> CalibrationRecord:
+def read_baf_calibration(file_path: str) -> FticrCalibrationRecord:
     matches = [
         raw
         for raw in get_raw_vectors(file_path)
-        if CalibrationRecord.calibration_fields_offset(raw) is not None
+        if FticrCalibrationRecord.calibration_fields_offset(raw) is not None
     ]
 
     if len(matches) != 1:
@@ -295,13 +295,13 @@ def read_baf_calibration(file_path: str) -> CalibrationRecord:
             f"Expected one calibration record, found {len(matches)}"
         )
 
-    return CalibrationRecord.from_bytes(matches[0])
+    return FticrCalibrationRecord.from_bytes(matches[0])
 
 
 def read_baf_maxima_block(
     file_path: str,
     block_start: int,
-    calibration: CalibrationRecord,
+    calibration: FticrCalibrationRecord,
 ) -> tuple[list[float], tuple[float, ...]]:
 
     def read_exact(file, size):
